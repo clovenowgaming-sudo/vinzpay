@@ -2,4 +2,6 @@ build/
 .gradle/
 local.properties
 server/db.json
+server/admin.key
+server/.env
 node_modules/

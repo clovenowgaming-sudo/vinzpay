@@ -12,7 +12,9 @@ object Api {
 
     suspend fun call(method: String, path: String, body: JSONObject? = null): JSONObject =
         withContext(Dispatchers.IO) {
-            val c = URL(base.trim().trimEnd('/') + path).openConnection() as HttpURLConnection
+            var b = base.trim().trimEnd('/')
+            if (!b.startsWith("http://") && !b.startsWith("https://")) b = "http://$b"
+            val c = URL(b + path).openConnection() as HttpURLConnection
             try {
                 c.requestMethod = method
                 c.connectTimeout = 10000
@@ -30,7 +32,7 @@ object Api {
                 if (code !in 200..299) throw Exception(j.optString("error", "Error $code"))
                 j
             } catch (e: java.io.IOException) {
-                throw Exception("Tidak bisa terhubung ke server. Cek URL & koneksi.")
+                throw Exception("Tidak bisa terhubung ke $b (${e.javaClass.simpleName}: ${e.message}). Pastikan server jalan & URL benar.")
             } finally {
                 c.disconnect()
             }

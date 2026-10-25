@@ -1,14 +1,19 @@
 const http=require('http'),fs=require('fs'),crypto=require('crypto');
 const PORT=+process.env.PORT||3000, DB=process.env.DB||'db.json';
-const SHOW_OTP=process.env.SHOW_OTP!=='0';        // 0 = jangan kirim OTP di response (sambungkan SMS gateway di sendOtp)
+const SHOW_OTP=process.env.SHOW_OTP!=='0';
 const XKEY=process.env.XENDIT_SECRET_KEY||'';
-const TOPUP_MODE=XKEY?'xendit':'demo';             // tanpa key Xendit = demo (saldo langsung bertambah)
+const TOPUP_MODE=XKEY?'xendit':'manual';
 const XBASE=process.env.XENDIT_BASE||'https://api.xendit.co';
 const DBASE=process.env.DIGIFLAZZ_BASE||'https://api.digiflazz.com/v1';
 const PUBLIC_URL=process.env.PUBLIC_URL||'';
 const CB_TOKEN=process.env.XENDIT_CALLBACK_TOKEN||'';
 const DUSER=process.env.DIGIFLAZZ_USER||'',DKEY=process.env.DIGIFLAZZ_KEY||'',DDEV=process.env.DIGIFLAZZ_DEV!=='0';
-const MARKUP=+process.env.MARKUP||0;               // untung per transaksi toko (Rp)
+const MARKUP=+process.env.MARKUP||0;
+const MARKUP_PCT=+process.env.MARKUP_PCT||0;
+const TOPUP_INFO=process.env.TOPUP_INFO||'Transfer ke admin, lalu kirim bukti + kode top up.';
+let ADMIN_KEY=process.env.ADMIN_KEY||'';
+if(!ADMIN_KEY){try{ADMIN_KEY=fs.readFileSync(__dirname+'/admin.key','utf8').trim()}catch{}
+  if(!ADMIN_KEY){ADMIN_KEY=crypto.randomBytes(16).toString('hex');fs.writeFileSync(__dirname+'/admin.key',ADMIN_KEY)}}
 let db={users:{},tx:[],otps:{},sessions:{}};
 try{db=JSON.parse(fs.readFileSync(DB,'utf8'))}catch{}
 const save=()=>fs.writeFileSync(DB,JSON.stringify(db));
@@ -28,7 +33,7 @@ const checkPin=(u,pin)=>{
 };
 const amountOf=v=>{const a=Number(v);if(!Number.isInteger(a)||a<=0||a>50000000)throw err('Nominal tidak valid (1 - 50.000.000)');return a};
 const addTx=t=>{db.tx.push({id:crypto.randomUUID(),ts:Date.now(),...t})};
-async function sendOtp(phone,code){console.log(`[OTP] ${phone}: ${code}`);/* TODO: panggil SMS/WhatsApp gateway di sini */}
+async function sendOtp(phone,code){console.log(`[OTP] ${phone}: ${code}`);}
 
 function tlv(s){const o={};let i=0;while(i+4<=s.length){const t=s.slice(i,i+2),l=+s.slice(i+2,i+4);if(isNaN(l)||i+4+l>s.length)throw err('QRIS tidak valid');o[t]=s.slice(i+4,i+4+l);i+=4+l}return o}
 function crc16(s){let c=0xFFFF;for(let i=0;i<s.length;i++){c^=s.charCodeAt(i)<<8;for(let j=0;j<8;j++)c=c&0x8000?((c<<1)^0x1021)&0xFFFF:(c<<1)&0xFFFF}return c.toString(16).toUpperCase().padStart(4,'0')}
@@ -51,14 +56,14 @@ async function xendit(method,path,body){
 }
 async function settleTopup(id){
   const t=db.topups[id];if(!t)throw err('Topup tidak ditemukan',404);
-  if(t.status==='PAID')return t;
+  if(t.status!=='PENDING'||t.manual)return t;
   let paid=false;
   try{
     const p=await xendit('GET','/qr_codes/payments?external_id='+encodeURIComponent(id));
     const list=Array.isArray(p)?p:(p.data||[]);
     paid=list.some(x=>x.status==='COMPLETED'&&Number(x.amount)>=t.amount);
   }catch(e){
-    const q=await xendit('GET','/qr_codes/'+encodeURIComponent(id));  // fallback: QR dinamis INACTIVE = sudah dibayar
+    const q=await xendit('GET','/qr_codes/'+encodeURIComponent(id));
     paid=q.status==='INACTIVE';
   }
   if(paid&&t.status==='PENDING'){
@@ -80,7 +85,7 @@ async function prices(){
   plCache={ts:Date.now(),items:j.data.filter(x=>x.buyer_product_status&&x.seller_product_status)};
   return plCache.items;
 }
-const sell=p=>Math.ceil(Number(p.price)+MARKUP);
+const sell=p=>Math.ceil(Number(p.price)*(1+MARKUP_PCT/100)+MARKUP);
 function applyDfz(o,j){
   const d=(j&&j.data)||{};
   if(d.status==='Sukses'){o.status='SUCCESS';o.sn=d.sn||''}
@@ -92,7 +97,15 @@ function applyDfz(o,j){
 }
 const dfzTx=o=>dfz('/transaction',{buyer_sku_code:o.sku,customer_no:o.target,ref_id:o.ref,sign:md5(DUSER+DKEY+o.ref),...(DDEV?{testing:true}:{})});
 
+const adminAuth=req=>{
+  const ip=req.socket.remoteAddress||'';
+  if(!['127.0.0.1','::1','::ffff:127.0.0.1'].includes(ip)||req.headers['x-forwarded-for'])throw err('forbidden',403);
+  const k=String(req.headers['x-admin-key']||'');
+  if(k.length!==ADMIN_KEY.length||!crypto.timingSafeEqual(Buffer.from(k),Buffer.from(ADMIN_KEY)))throw err('forbidden',403);
+};
+
 const routes={
+ 'GET /ping':async()=>({ok:true,mode:TOPUP_MODE}),
  'POST /register':async(req,b)=>{
    const phone=norm(b.phone);if(!validPhone(phone))throw err('Nomor HP tidak valid (contoh 0812xxxxxxx)');
    if(db.users[phone])throw err('Nomor sudah terdaftar, silakan login');
@@ -124,7 +137,12 @@ const routes={
  'GET /me':async(req)=>{const u=db.users[auth(req)];return{phone:u.phone,balance:u.balance}},
  'POST /topup/qris':async(req,b)=>{
    const u=db.users[auth(req)];const a=amountOf(b.amount);
-   if(TOPUP_MODE==='demo'){u.balance+=a;addTx({type:'topup',to:u.phone,amount:a,desc:'Top up (demo)'});save();return{paid:true,balance:u.balance}}
+   if(TOPUP_MODE==='manual'){
+     if(a<1000)throw err('Minimal top up Rp1.000');
+     const id='TP-'+crypto.randomBytes(3).toString('hex').toUpperCase();
+     db.topups[id]={phone:u.phone,amount:a,status:'PENDING',manual:true,ts:Date.now()};save();
+     return{id,amount:a,info:TOPUP_INFO,manual:true};
+   }
    if(a<1500)throw err('Minimal top up Rp1.500');
    const id='tp-'+crypto.randomBytes(8).toString('hex');
    const q=await xendit('POST','/qr_codes',{external_id:id,type:'DYNAMIC',amount:a,callback_url:PUBLIC_URL?PUBLIC_URL+'/webhook/xendit':'https://example.com/noop'});
@@ -134,7 +152,7 @@ const routes={
  'GET /topup/status':async(req)=>{
    const p=auth(req),id=qs(req,'id'),t=db.topups[id];
    if(!t||t.phone!==p)throw err('Topup tidak ditemukan',404);
-   const r=await settleTopup(id);return{paid:r.status==='PAID',balance:db.users[p].balance};
+   const r=await settleTopup(id);return{paid:r.status==='PAID',status:r.status,balance:db.users[p].balance};
  },
  'POST /topup/simulate':async(req,b)=>{
    const p=auth(req);if(!XKEY.startsWith('xnd_development'))throw err('Hanya untuk sandbox');
@@ -144,9 +162,35 @@ const routes={
  'POST /webhook/xendit':async(req,b)=>{
    if(CB_TOKEN&&req.headers['x-callback-token']!==CB_TOKEN)throw err('forbidden',403);
    const id=b.external_id||(b.qr_code&&b.qr_code.external_id)||(b.data&&b.data.qr_code&&b.data.qr_code.external_id);
-   if(id&&db.topups[id])await settleTopup(id).catch(()=>{});   // status selalu diverifikasi ulang ke Xendit
+   if(id&&db.topups[id])await settleTopup(id).catch(()=>{});
    return{ok:true};
  },
+ 'GET /admin/users':async(req)=>{adminAuth(req);return{users:Object.values(db.users).map(u=>({phone:u.phone,balance:u.balance}))}},
+ 'POST /admin/topup':async(req,b)=>{
+   adminAuth(req);const ph=norm(b.phone),u=db.users[ph];if(!u)throw err('User tidak terdaftar');
+   const a=amountOf(b.amount);u.balance+=a;addTx({type:'topup',to:ph,amount:a,desc:'Top up oleh admin'});save();return{phone:ph,balance:u.balance};
+ },
+ 'GET /admin/pending':async(req)=>{adminAuth(req);return{items:Object.entries(db.topups).filter(([k,t])=>t.manual&&t.status==='PENDING').map(([k,t])=>({id:k,phone:t.phone,amount:t.amount,ts:t.ts}))}},
+ 'POST /admin/approve':async(req,b)=>{
+   adminAuth(req);const t=db.topups[String(b.id).toUpperCase()];
+   if(!t||!t.manual||t.status!=='PENDING')throw err('Permintaan tidak ditemukan / sudah diproses');
+   t.status='PAID';const u=db.users[t.phone];u.balance+=t.amount;addTx({type:'topup',to:t.phone,amount:t.amount,desc:'Top up (dikonfirmasi admin)'});save();
+   return{phone:t.phone,balance:u.balance};
+ },
+ 'POST /admin/reject':async(req,b)=>{
+   adminAuth(req);const t=db.topups[String(b.id).toUpperCase()];
+   if(!t||!t.manual||t.status!=='PENDING')throw err('Permintaan tidak ditemukan / sudah diproses');
+   t.status='REJECTED';save();return{ok:true};
+ },
+ 'POST /admin/reset-pin':async(req,b)=>{
+   adminAuth(req);const u=db.users[norm(b.phone)];if(!u)throw err('User tidak terdaftar');
+   if(!/^\d{6}$/.test(String(b.pin)))throw err('PIN harus 6 digit');
+   u.salt=crypto.randomBytes(16).toString('hex');u.pin=hash(b.pin,u.salt);u.fails=0;u.lockUntil=0;
+   for(const t of Object.keys(db.sessions))if(db.sessions[t].phone===u.phone)delete db.sessions[t];save();return{ok:true};
+ },
+ 'GET /admin/orders':async(req)=>{adminAuth(req);return{orders:db.orders.slice(-30).reverse()}},
+ 'GET /admin/supplier':async(req)=>{adminAuth(req);const j=await dfz('/cek-saldo',{cmd:'deposit',sign:md5(DUSER+DKEY+'depo')});return j.data||j},
+ 'GET /shop/categories':async(req)=>{auth(req);return{categories:[...new Set((await prices()).map(x=>x.category))].filter(Boolean).sort()}},
  'GET /shop/brands':async(req)=>{
    auth(req);const cat=qs(req,'cat')||'Games';
    return{brands:[...new Set((await prices()).filter(x=>x.category===cat).map(x=>x.brand))].sort()};
@@ -164,7 +208,7 @@ const routes={
    const price=sell(p);if(u.balance<price)throw err('Saldo tidak cukup');
    const o={ref:'ord-'+crypto.randomBytes(8).toString('hex'),phone:u.phone,sku:p.buyer_sku_code,name:p.product_name,target,price,status:'PENDING',sn:'',ts:Date.now()};
    u.balance-=price;db.orders.push(o);addTx({type:'shop',from:u.phone,to:'SHOP',amount:price,desc:p.product_name+' > '+target});save();
-   try{applyDfz(o,await dfzTx(o))}catch(e){/* tetap PENDING, dicek ulang di /shop/orders */}
+   try{applyDfz(o,await dfzTx(o))}catch(e){}
    return{status:o.status,sn:o.sn,balance:u.balance};
  },
  'GET /shop/orders':async(req)=>{
@@ -181,12 +225,8 @@ const routes={
  },
  'POST /qris/parse':async(req,b)=>{auth(req);return parseQris(b.qris)},
  'POST /qris/pay':async(req,b)=>{
-   const u=db.users[auth(req)];
-   if(TOPUP_MODE!=='demo')throw err('Bayar QRIS merchant belum didukung (butuh izin PJP). Gunakan menu Toko untuk beli game/pulsa.');
-   checkPin(u,b.pin);
-   const q=parseQris(b.qris),a=q.amount||amountOf(b.amount);
-   if(u.balance<a)throw err('Saldo tidak cukup');
-   u.balance-=a;addTx({type:'qris',from:u.phone,to:'QRIS:'+q.merchant,amount:a,desc:'QRIS '+q.merchant+(q.city?' - '+q.city:'')+' (demo, belum settlement)'});save();return{balance:u.balance};
+   auth(req);
+   throw err('Bayar QRIS merchant belum didukung (butuh izin PJP). Gunakan menu Toko untuk beli game/pulsa.');
  },
  'GET /history':async(req)=>{
    const p=auth(req);

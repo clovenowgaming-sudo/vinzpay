@@ -43,6 +43,22 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+fun savedServer(p: SharedPreferences): String {
+    val s = p.getString("server", null)
+    return if (s.isNullOrEmpty() || s == "http://10.0.2.2:3000") "http://127.0.0.1:3000" else s
+}
+
+@Composable
+fun PingButton(server: String, onResult: (String) -> Unit) {
+    val scope = rememberCoroutineScope()
+    OutlinedButton({
+        scope.launch {
+            try { Api.base = server; Api.call("GET", "/ping"); onResult("OK: server terhubung") }
+            catch (e: Exception) { onResult(e.message ?: "Error") }
+        }
+    }, Modifier.fillMaxWidth()) { Text("Tes koneksi server") }
+}
+
 fun rp(n: Long) = "Rp" + "%,d".format(n).replace(',', '.')
 
 @Composable
@@ -64,7 +80,7 @@ fun Back(nav: (String, String) -> Unit) = TextButton({ nav("home", "") }) { Text
 
 @Composable
 fun Msg(m: String, ok: Boolean = false) {
-    if (m.isNotEmpty()) Text(m, color = if (ok) Color(0xFF2E7D32) else Color.Red)
+    if (m.isNotEmpty()) Text(m, color = if (ok || m.startsWith("OK:")) Color(0xFF2E7D32) else Color.Red)
 }
 
 fun saveSession(p: SharedPreferences, token: String) {
@@ -78,7 +94,7 @@ fun App(ctx: Context) {
     var screen by remember { mutableStateOf(if (prefs.getString("token", "").isNullOrEmpty()) "login" else "home") }
     var arg by remember { mutableStateOf("") }
     remember {
-        Api.base = prefs.getString("server", "http://10.0.2.2:3000")!!
+        Api.base = savedServer(prefs)
         Api.token = prefs.getString("token", "")!!
         0
     }
@@ -103,7 +119,7 @@ fun App(ctx: Context) {
 @Composable
 fun Login(prefs: SharedPreferences, nav: (String, String) -> Unit) {
     val scope = rememberCoroutineScope()
-    var server by remember { mutableStateOf(prefs.getString("server", "http://10.0.2.2:3000")!!) }
+    var server by remember { mutableStateOf(savedServer(prefs)) }
     var phone by remember { mutableStateOf("") }
     var pin by remember { mutableStateOf("") }
     var msg by remember { mutableStateOf("") }
@@ -114,6 +130,7 @@ fun Login(prefs: SharedPreferences, nav: (String, String) -> Unit) {
         F(phone, "Nomor HP", { phone = it }, KeyboardType.Phone)
         F(pin, "PIN (6 digit)", { pin = it }, KeyboardType.NumberPassword, true)
         Msg(msg)
+        PingButton(server) { msg = it }
         Button({
             scope.launch {
                 try {
@@ -137,14 +154,18 @@ fun Register(prefs: SharedPreferences, nav: (String, String) -> Unit) {
     var p2 by remember { mutableStateOf("") }
     var msg by remember { mutableStateOf("") }
     var hint by remember { mutableStateOf("") }
+    var server by remember { mutableStateOf(savedServer(prefs)) }
     fun run(b: suspend () -> Unit) { scope.launch { try { msg = ""; b() } catch (e: Exception) { msg = e.message ?: "Error" } } }
     Col {
         TextButton({ nav("login", "") }) { Text("← Login") }
         Text("Daftar", fontSize = 28.sp, fontWeight = FontWeight.Bold)
         when (stage) {
             0 -> {
+                F(server, "Server URL (http://IP:3000)", { server = it })
                 F(phone, "Nomor HP", { phone = it }, KeyboardType.Phone)
+                PingButton(server) { msg = it }
                 Button({ run {
+                    Api.base = server; prefs.edit().putString("server", server).apply()
                     val r = Api.call("POST", "/register", JSONObject().put("phone", phone))
                     hint = r.optString("otp_dev"); stage = 1
                 } }, Modifier.fillMaxWidth()) { Text("Kirim OTP") }
@@ -218,6 +239,7 @@ fun TopUp(nav: (String, String) -> Unit) {
     var ok by remember { mutableStateOf(false) }
     var qr by remember { mutableStateOf("") }
     var id by remember { mutableStateOf("") }
+    var info by remember { mutableStateOf("") }
     var sandbox by remember { mutableStateOf(false) }
     var paid by remember { mutableStateOf(false) }
     LaunchedEffect(id) {
@@ -225,14 +247,15 @@ fun TopUp(nav: (String, String) -> Unit) {
             delay(3000)
             try {
                 val r = Api.call("GET", "/topup/status?id=$id")
-                if (r.getBoolean("paid")) { paid = true; ok = true; msg = "Pembayaran diterima! Saldo: " + rp(r.getLong("balance")) }
+                if (r.getBoolean("paid")) { paid = true; ok = true; msg = "Top up berhasil! Saldo: " + rp(r.getLong("balance")) }
+                else if (r.optString("status") == "REJECTED") { id = ""; qr = ""; info = ""; ok = false; msg = "Top up ditolak admin." }
             } catch (e: Exception) { }
         }
     }
     Col {
         Back(nav)
         Text("Top Up Saldo", fontSize = 26.sp, fontWeight = FontWeight.Bold)
-        if (qr.isEmpty()) {
+        if (id.isEmpty()) {
             F(amt, "Nominal (Rp)", { amt = it.filter(Char::isDigit) }, KeyboardType.Number)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 for (v in listOf("20000", "50000", "100000")) OutlinedButton({ amt = v }) { Text(rp(v.toLong())) }
@@ -242,19 +265,24 @@ fun TopUp(nav: (String, String) -> Unit) {
                     try {
                         msg = ""
                         val r = Api.call("POST", "/topup/qris", JSONObject().put("amount", amt.toLongOrNull() ?: 0))
-                        if (r.optBoolean("paid")) { paid = true; ok = true; msg = "Berhasil. Saldo: " + rp(r.getLong("balance")); qr = "-" }
-                        else { qr = r.getString("qr_string"); id = r.getString("id"); sandbox = r.optBoolean("sandbox") }
+                        qr = r.optString("qr_string"); info = r.optString("info"); sandbox = r.optBoolean("sandbox")
+                        id = r.getString("id")
                     } catch (e: Exception) { ok = false; msg = e.message ?: "Error" }
                 }
-            }, Modifier.fillMaxWidth()) { Text("Buat QRIS Top Up") }
+            }, Modifier.fillMaxWidth()) { Text("Minta Top Up") }
         } else if (!paid) {
-            Text("Scan QRIS ini dengan e-wallet / m-banking. Nominal " + rp(amt.toLongOrNull() ?: 0))
-            Image(remember(qr) { qrBitmap(qr) }, "QRIS", Modifier.size(280.dp))
-            Text("Menunggu pembayaran...")
+            Text("Kode top up: $id", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Text("Nominal " + rp(amt.toLongOrNull() ?: 0))
+            if (qr.isNotEmpty()) {
+                Text("Scan QRIS ini dengan e-wallet / m-banking.")
+                Image(remember(qr) { qrBitmap(qr) }, "QRIS", Modifier.size(280.dp))
+            }
+            if (info.isNotEmpty()) Text(info)
+            Text("Saldo masuk otomatis setelah pembayaran dikonfirmasi...")
             if (sandbox) OutlinedButton({
                 scope.launch { try { Api.call("POST", "/topup/simulate", JSONObject().put("id", id)) } catch (e: Exception) { msg = e.message ?: "Error" } }
             }) { Text("Simulasi bayar (sandbox)") }
-            OutlinedButton({ qr = ""; id = "" }) { Text("Batal") }
+            OutlinedButton({ id = ""; qr = ""; info = "" }) { Text("Tutup") }
         } else {
             Button({ nav("home", "") }, Modifier.fillMaxWidth()) { Text("Selesai") }
         }
@@ -302,14 +330,7 @@ fun MyQr(nav: (String, String) -> Unit) {
         Back(nav)
         Text("QR Saya", fontSize = 26.sp, fontWeight = FontWeight.Bold)
         if (phone.isNotEmpty()) {
-            val bmp = remember(phone) {
-                val m = QRCodeWriter().encode("VINZPAY|$phone", BarcodeFormat.QR_CODE, 600, 600)
-                val b = Bitmap.createBitmap(600, 600, Bitmap.Config.RGB_565)
-                for (x in 0 until 600) for (y in 0 until 600)
-                    b.setPixel(x, y, if (m[x, y]) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
-                b.asImageBitmap()
-            }
-            Image(bmp, "QR", Modifier.size(280.dp))
+            Image(remember(phone) { qrBitmap("VINZPAY|$phone") }, "QR", Modifier.size(280.dp))
             Text(phone)
             Text("Minta teman scan QR ini untuk menerima transfer.")
         }
@@ -336,14 +357,10 @@ fun Scan(nav: (String, String) -> Unit) {
 
 @Composable
 fun Qris(payload: String, nav: (String, String) -> Unit) {
-    val scope = rememberCoroutineScope()
     var merchant by remember { mutableStateOf("") }
     var city by remember { mutableStateOf("") }
     var fixed by remember { mutableStateOf(0L) }
-    var amt by remember { mutableStateOf("") }
-    var pin by remember { mutableStateOf("") }
     var msg by remember { mutableStateOf("") }
-    var ok by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         try {
             val r = Api.call("POST", "/qris/parse", JSONObject().put("qris", payload))
@@ -352,24 +369,14 @@ fun Qris(payload: String, nav: (String, String) -> Unit) {
     }
     Col {
         Back(nav)
-        Text("Bayar QRIS", fontSize = 26.sp, fontWeight = FontWeight.Bold)
+        Text("QRIS", fontSize = 26.sp, fontWeight = FontWeight.Bold)
         if (merchant.isNotEmpty()) {
             Text(merchant, fontSize = 20.sp, fontWeight = FontWeight.Bold)
             Text(city)
             if (fixed > 0) Text("Nominal: " + rp(fixed), fontSize = 22.sp)
-            else F(amt, "Nominal (Rp)", { amt = it.filter(Char::isDigit) }, KeyboardType.Number)
-            F(pin, "PIN", { pin = it }, KeyboardType.NumberPassword, true)
-            Button({
-                scope.launch {
-                    try {
-                        val r = Api.call("POST", "/qris/pay", JSONObject().put("qris", payload)
-                            .put("amount", amt.toLongOrNull() ?: 0).put("pin", pin))
-                        ok = true; msg = "Pembayaran tercatat. Saldo: " + rp(r.getLong("balance")); pin = ""
-                    } catch (e: Exception) { ok = false; msg = e.message ?: "Error" }
-                }
-            }, Modifier.fillMaxWidth()) { Text("Bayar") }
+            Text("Pembayaran ke merchant QRIS belum didukung (butuh izin PJP). Untuk beli game, pulsa, PLN, dan paket data gunakan menu Toko.")
         }
-        Msg(msg, ok)
+        Msg(msg)
     }
 }
 
@@ -407,6 +414,7 @@ fun History(nav: (String, String) -> Unit) {
 fun Shop(nav: (String, String) -> Unit) {
     val scope = rememberCoroutineScope()
     var cat by remember { mutableStateOf("Games") }
+    var cats by remember { mutableStateOf(listOf<String>()) }
     var brands by remember { mutableStateOf(listOf<String>()) }
     var brand by remember { mutableStateOf("") }
     var products by remember { mutableStateOf(listOf<JSONObject>()) }
@@ -416,6 +424,13 @@ fun Shop(nav: (String, String) -> Unit) {
     var msg by remember { mutableStateOf("") }
     var ok by remember { mutableStateOf(false) }
     fun enc(x: String) = java.net.URLEncoder.encode(x, "UTF-8")
+    LaunchedEffect(Unit) {
+        try {
+            val a = Api.call("GET", "/shop/categories").getJSONArray("categories")
+            cats = (0 until a.length()).map { a.getString(it) }
+            if (cats.isNotEmpty() && cat !in cats) cat = cats.first()
+        } catch (e: Exception) { }
+    }
     LaunchedEffect(cat) {
         brand = ""; products = emptyList(); sel = null; brands = emptyList(); msg = ""
         try {
@@ -436,7 +451,7 @@ fun Shop(nav: (String, String) -> Unit) {
         Back(nav)
         Text("Toko", fontSize = 26.sp, fontWeight = FontWeight.Bold)
         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            for (c in listOf("Games", "Pulsa", "Data", "E-Money", "PLN", "Voucher")) {
+            for (c in cats.ifEmpty { listOf("Games", "Pulsa", "Data", "PLN") }) {
                 if (c == cat) Button({ cat = c }) { Text(c) } else OutlinedButton({ cat = c }) { Text(c) }
             }
         }

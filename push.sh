@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Pakai: ./push.sh nama-repo
 set -e
 git init -q 2>/dev/null || true
 git add -A && git commit -qm "VinzPay" || true
